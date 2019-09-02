@@ -8,12 +8,15 @@ use std::rc::Rc;
 use util;
 use {raw, Error, SessionInner};
 
+pub(crate) struct SftpInner {
+    raw: *mut raw::LIBSSH2_SFTP,
+    _sess: Rc<SessionInner>,
+}
 /// A handle to a remote filesystem over SFTP.
 ///
 /// Instances are created through the `sftp` method on a `Session`.
 pub struct Sftp {
-    raw: *mut raw::LIBSSH2_SFTP,
-    _sess: Rc<SessionInner>,
+    inner: Rc<SftpInner>,
 }
 
 /// A file handle to an SFTP connection.
@@ -23,9 +26,9 @@ pub struct Sftp {
 ///
 /// Files are created through `open`, `create`, and `open_mode` on an instance
 /// of `Sftp`.
-pub struct File<'sftp> {
+pub struct File {
     raw: *mut raw::LIBSSH2_SFTP_HANDLE,
-    sftp: &'sftp Sftp,
+    sftp: Rc<SftpInner>,
 }
 
 /// Metadata information about a remote file.
@@ -102,6 +105,23 @@ pub enum OpenType {
     Dir = raw::LIBSSH2_SFTP_OPENDIR as isize,
 }
 
+impl SftpInner {
+    /// Peel off the last error to happen on this SFTP instance.
+    pub fn last_error(&self) -> Error {
+        let code = unsafe { raw::libssh2_sftp_last_error(self.raw) };
+        Error::from_errno(code as c_int)
+    }
+
+    /// Translates a return code into a Rust-`Result`
+    pub fn rc(&self, rc: c_int) -> Result<(), Error> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(self.last_error())
+        }
+    }
+}
+
 impl Sftp {
     pub(crate) fn from_raw_opt(
         raw: *mut raw::LIBSSH2_SFTP,
@@ -111,8 +131,10 @@ impl Sftp {
             Err(Error::last_error_raw(sess.raw).unwrap_or_else(Error::unknown))
         } else {
             Ok(Self {
-                raw,
-                _sess: Rc::clone(sess),
+                inner: Rc::new(SftpInner {
+                    raw,
+                    _sess: Rc::clone(sess),
+                }),
             })
         }
     }
@@ -128,7 +150,7 @@ impl Sftp {
         let filename = try!(util::path2bytes(filename));
         unsafe {
             let ret = raw::libssh2_sftp_open_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
                 flags.bits() as c_ulong,
@@ -191,7 +213,7 @@ impl Sftp {
         let filename = try!(util::path2bytes(filename));
         self.rc(unsafe {
             raw::libssh2_sftp_mkdir_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
                 mode as c_long,
@@ -204,7 +226,7 @@ impl Sftp {
         let filename = try!(util::path2bytes(filename));
         self.rc(unsafe {
             raw::libssh2_sftp_rmdir_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
             )
@@ -217,7 +239,7 @@ impl Sftp {
         unsafe {
             let mut ret = mem::zeroed();
             let rc = raw::libssh2_sftp_stat_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
                 raw::LIBSSH2_SFTP_STAT,
@@ -234,7 +256,7 @@ impl Sftp {
         unsafe {
             let mut ret = mem::zeroed();
             let rc = raw::libssh2_sftp_stat_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
                 raw::LIBSSH2_SFTP_LSTAT,
@@ -251,7 +273,7 @@ impl Sftp {
         self.rc(unsafe {
             let mut raw = stat.raw();
             raw::libssh2_sftp_stat_ex(
-                self.raw,
+                self.inner.raw,
                 filename.as_ptr() as *const _,
                 filename.len() as c_uint,
                 raw::LIBSSH2_SFTP_SETSTAT,
@@ -266,7 +288,7 @@ impl Sftp {
         let target = try!(util::path2bytes(target));
         self.rc(unsafe {
             raw::libssh2_sftp_symlink_ex(
-                self.raw,
+                self.inner.raw,
                 path.as_ptr() as *const _,
                 path.len() as c_uint,
                 target.as_ptr() as *mut _,
@@ -293,7 +315,7 @@ impl Sftp {
         loop {
             rc = unsafe {
                 raw::libssh2_sftp_symlink_ex(
-                    self.raw,
+                    self.inner.raw,
                     path.as_ptr() as *const _,
                     path.len() as c_uint,
                     ret.as_ptr() as *mut _,
@@ -335,7 +357,7 @@ impl Sftp {
         let dst = try!(util::path2bytes(dst));
         self.rc(unsafe {
             raw::libssh2_sftp_rename_ex(
-                self.raw,
+                self.inner.raw,
                 src.as_ptr() as *const _,
                 src.len() as c_uint,
                 dst.as_ptr() as *const _,
@@ -349,41 +371,39 @@ impl Sftp {
     pub fn unlink(&self, file: &Path) -> Result<(), Error> {
         let file = try!(util::path2bytes(file));
         self.rc(unsafe {
-            raw::libssh2_sftp_unlink_ex(self.raw, file.as_ptr() as *const _, file.len() as c_uint)
+            raw::libssh2_sftp_unlink_ex(
+                self.inner.raw,
+                file.as_ptr() as *const _,
+                file.len() as c_uint,
+            )
         })
     }
 
     /// Peel off the last error to happen on this SFTP instance.
     pub fn last_error(&self) -> Error {
-        let code = unsafe { raw::libssh2_sftp_last_error(self.raw) };
-        Error::from_errno(code as c_int)
+        self.inner.last_error()
     }
 
     /// Translates a return code into a Rust-`Result`
     pub fn rc(&self, rc: c_int) -> Result<(), Error> {
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(self.last_error())
-        }
+        self.inner.rc(rc)
     }
 }
 
-impl Drop for Sftp {
+impl Drop for SftpInner {
     fn drop(&mut self) {
         unsafe { assert_eq!(raw::libssh2_sftp_shutdown(self.raw), 0) }
     }
 }
 
-impl<'sftp> File<'sftp> {
-    /// Wraps a raw pointer in a new File structure tied to the lifetime of the
-    /// given session.
+impl File {
+    /// Wraps a raw pointer in a new File structure.
     ///
     /// This consumes ownership of `raw`.
-    unsafe fn from_raw(sftp: &'sftp Sftp, raw: *mut raw::LIBSSH2_SFTP_HANDLE) -> File<'sftp> {
+    unsafe fn from_raw(sftp: &Sftp, raw: *mut raw::LIBSSH2_SFTP_HANDLE) -> File {
         File {
             raw: raw,
-            sftp: sftp,
+            sftp: Rc::clone(&sftp.inner),
         }
     }
 
@@ -468,7 +488,7 @@ impl<'sftp> File<'sftp> {
     }
 }
 
-impl<'sftp> Read for File<'sftp> {
+impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         unsafe {
             let rc =
@@ -481,7 +501,7 @@ impl<'sftp> Read for File<'sftp> {
     }
 }
 
-impl<'sftp> Write for File<'sftp> {
+impl Write for File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let rc = unsafe {
             raw::libssh2_sftp_write(self.raw, buf.as_ptr() as *const _, buf.len() as size_t)
@@ -497,7 +517,7 @@ impl<'sftp> Write for File<'sftp> {
     }
 }
 
-impl<'sftp> Seek for File<'sftp> {
+impl Seek for File {
     /// Move the file handle's internal pointer to an arbitrary location.
     ///
     /// libssh2 implements file pointers as a localized concept to make file
@@ -528,7 +548,7 @@ impl<'sftp> Seek for File<'sftp> {
     }
 }
 
-impl<'sftp> Drop for File<'sftp> {
+impl Drop for File {
     fn drop(&mut self) {
         unsafe { assert_eq!(raw::libssh2_sftp_close_handle(self.raw), 0) }
     }
